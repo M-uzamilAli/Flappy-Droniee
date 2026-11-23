@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flappy Droniee</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0b1320;color:#eff7ff;font:1rem system-ui}
+main{max-width:1240px;margin:auto;padding:clamp(1rem,3vw,2rem)}
+header,.controls,.hud{display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+h1{font-size:clamp(1.8rem,4vw,3rem);letter-spacing:-.045em;margin:0}
+.stage{position:relative;margin:1rem 0;border:1px solid #344d63;border-radius:1rem;overflow:hidden;box-shadow:0 24px 60px #050a1280}
+canvas{display:block;width:100%;min-height:240px;object-fit:contain;background:#172b3e}
+.hud{position:absolute;inset:0 0 auto;padding:.75rem 1rem;pointer-events:none;background:linear-gradient(#0b1320bf,transparent);font-variant-numeric:tabular-nums}
+.overlay{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;gap:.6rem;padding:2rem;text-align:center;background:#0b132099}
+.overlay[hidden]{display:none}
+.overlay h2{font-size:clamp(1.4rem,4vw,2.4rem);margin:0}
+.overlay p{margin:0;color:#c7deef}
+button,input{font:inherit;border-radius:.5rem;padding:.6rem .8rem}
+button{border:0;background:#83f0cc;color:#0c1420;font-weight:700;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+input{width:5rem;background:#1b2d40;color:inherit;border:1px solid #526987}
+#status,small,a{color:#aac6de}
+details{background:#142233;border-radius:.75rem;padding:.8rem 1rem}
+summary{color:#c8e5f3;cursor:pointer;width:fit-content}
+details .controls{margin-top:1rem;justify-content:flex-start}
+#pairing{margin-top:1rem}
+#pairing img:not([hidden]){display:block;width:160px;height:160px;margin:.75rem 0;border-radius:.35rem}
+a{overflow-wrap:anywhere}
+</style>
+<main>
+<header><h1>Flappy Droniee</h1><output id="status" role="status">Connecting to host…</output></header>
+<div id="telemetry" title="Ping is the browser round trip. Gyro gap is the longest time between readings received in the last second.">Ping — · Gyro gap —</div>
+<section class="stage" aria-label="Game">
+<canvas id="field" width="960" height="440" aria-label="Drone obstacle course"></canvas>
+<div class="hud"><span id="score">Score 0</span><span id="level">Round 1</span><span id="height">Height 50%</span></div>
+<div class="overlay" id="overlay">
+<h2 id="run-title">Ready to fly</h2>
+<p id="run-hint">Pair your phone to start.</p>
+<button id="start" disabled>Start Game</button>
+</div>
+</section>
+<details id="settings" open>
+<summary>Controller settings</summary>
+<div class="controls">
+<label>Full tilt from neutral <input id="tilt" type="number" value="20" min="1" max="90"> °</label>
+<button id="reset" disabled>Reset Phone Pairing</button></div>
+<p><button id="sound" type="button">Enable Sound</button></p>
+<p><button id="download-log" type="button" disabled>Download Motion Log</button>
+<small id="log-status" role="status">Logging starts when motion arrives.</small></p>
+<section id="pairing" aria-label="Pair a phone">
+<strong>Scan with your phone on the same Wi-Fi</strong>
+<img id="qr" alt="Controller pairing QR code" hidden>
+<a id="link" hidden>Open controller link</a>
+</section>
+</details>
+</main>
+<script type="module">
+import {connect} from '/link.js';
+const byId = id => document.getElementById(id);
+const canvas = byId('field'), ctx = canvas.getContext('2d');
+const status = byId('status'), start = byId('start'), reset = byId('reset');
+const heightDisplay = byId('height'), tiltInput = byId('tilt');
+const overlay = byId('overlay'), settings = byId('settings');
+const telemetry = byId('telemetry'), sound = byId('sound');
+const downloadLog = byId('download-log'), logStatus = byId('log-status');
+const sky = ctx.createLinearGradient(0,0,0,440);
+sky.addColorStop(0,'#12243a');
+sky.addColorStop(1,'#346277');
+const clamp = (x, min, max) => Math.max(min, Math.min(max, x));
+const identity = () => [1,0,0,0];
+const MAX_WORLD_STEP_S = .05;
+const ROUND_DURATION_S = 20;
+const START_SPEED = 155;
+const MAX_SPEED = 340;
+const SPEED_GAIN_PER_SECOND = 2.6;
+const RECENTRE_KEY = 'c';
+const STRAIGHT_ONLY_S = 20;
+const LARGE_GAP = 168;
+const SMALL_GAP = 112;
+const GAP_SHRINK_PER_POINT = 4;
+const MAX_JUMP = 55;
+const PIPE_WIDTH = 58;
+const TUNNEL_WIDTH = 174;
+const PIPE_SPAWN_EDGE = 990;
+const PIPE_CLEARANCE = 222;
+const PIPE_CENTER_MARGIN = 32;
+const DRIFTER_SPEED = 210;
+const DRIFTER_WAVE_HEIGHT = 28;
+const DRIFTER_WAVE_SPEED = 2.4;
+const DRIFTER_SPAWN_INTERVAL_MIN = 6;
+const DRIFTER_SPAWN_INTERVAL_MAX = 10;
+const DRIFTER_START_SCORE = 5;
+const DRIFTER_RADIUS = 15;
+const DRIFTER_LANE_OFFSET = 70;
+const MIN_ENEMY_PIPE_DISTANCE = 90;
+const LASER_WARNING_S = 1;
+const LASER_FIRE_S = .5;
+const LASER_START_SCORE = 10;
+const LASER_BAND_PCT = 18;
+const LASER_COOLDOWN_S = 6;
+const LASER_WARNING_WIDTH = 4;
+const LASER_CLEARANCE = 10;
+const STRAIGHT_OFFSET = 34;
+const ZIGZAG_OFFSET = 66;
+const STAIR_OFFSET = 58;
+const TUNNEL_OFFSET = 48;
+const NARROW_OFFSET = 30;
+const PIPE_PATTERNS = [
+  {name:'straight', startScore:0, offsets:[-STRAIGHT_OFFSET]},
+  {name:'zigzag', startScore:1, offsets:[-ZIGZAG_OFFSET, ZIGZAG_OFFSET, -ZIGZAG_OFFSET]},
+  {name:'staircase', startScore:2, offsets:[-STAIR_OFFSET, 0, STAIR_OFFSET]},
+  {name:'tunnel', startScore:4, offsets:[-TUNNEL_OFFSET]},
+  {name:'narrow', startScore:6, offsets:[-NARROW_OFFSET, NARROW_OFFSET]}
+];
+let mode = 'ready', linked = false, phoneState = 'waiting', lastArrival = -Infinity;
+let manuallyPaused = false, send, reportedRun;
+let pose = identity(), previous, poseTilt = 0, angle = 0, height = .5;
+let tiltRate = 0, predictionRate = 0, previousTarget = .5, targetRate = 0;
+let distance = 0, elapsed = 0, round = 1, score = 0, gates = [], audio, lastChime = -Infinity;
+let pattern, patternStep, patternDirection, previousGapCenter;
+let drifter, nextDrifterAt;
+let laser, nextLaserAt;
+let hostState = 'connecting', previousFrame = performance.now();
+let probe, ping, maxGap = 0;
+const logStarted = performance.now();
+const logLimit = 120000;
+const logRows = [];
+let runNumber = 0;
+
+function logEvent(event, now, packet, gap, frameData, deathCause, spawnedPipe, spawnedEnemy, laserBand) {
+  if (logRows.length >= logLimit) return;
+  const freshPing = linked && ping && now - ping.received <= 2500 ? ping : undefined;
+  logRows.push([
+    event, (now - logStarted).toFixed(3), runNumber, mode, phoneState,
+    packet ? (packet.t * 1000).toFixed(3) : '',
+    Number.isFinite(gap) ? gap.toFixed(3) : '',
+    ...(packet ? packet.rates.map(rate => rate.toFixed(5)) : ['', '', '']),
+    angle.toFixed(3), tiltRate.toFixed(3), (height * 100).toFixed(3),
+    freshPing?.ms.toFixed(3) ?? '', freshPing ? Math.max(0, now - freshPing.received).toFixed(3) : '',
+    ...(frameData ? frameData.map(value => value.toFixed(3)) : ['', '', '', '', '']),
+    event === 'run_start' ? fullTilt().toFixed(3) : '',
+    deathCause ?? '', event === 'death' ? score : '',
+    ...(spawnedPipe ? [spawnedPipe.pattern,
+      (200 * spawnedPipe.halfGap / canvas.height).toFixed(3),
+      (100 * spawnedPipe.center / canvas.height).toFixed(3)] : ['', '', '']),
+    ...(spawnedEnemy ? [spawnedEnemy.type,
+      (100 * spawnedEnemy.y / canvas.height).toFixed(3)] : ['', '']),
+    laserBand ? (100 * laserBand.center / canvas.height).toFixed(3) : ''
+  ].join(','));
+  if (logRows.length === 1) {
+    downloadLog.disabled = false;
+    logStatus.textContent = 'Recording in this tab. Download before refreshing.';
+  } else if (logRows.length === logLimit) {
+    logStatus.textContent = 'Log limit reached. Download the recording before refreshing.';
+  }
+}
+
+downloadLog.onclick = () => {
+  const header = 'event,pc_elapsed_ms,run,game_state,phone_state,phone_sample_ms,arrival_gap_ms,' +
+    'gyro_x_rad_s,gyro_y_rad_s,gyro_z_rad_s,tilt_deg,tilt_rate_deg_s,drone_height_pct,ping_rtt_ms,ping_age_ms,' +
+    'target_height_pct,frame_gap_ms,gyro_sample_age_ms,tilt_used,est_time_ms,full_tilt_deg,death_cause,score,' +
+    'pipe_pattern,pipe_gap_size_pct,pipe_gap_height_pct,enemy_type,enemy_start_height_pct,laser_band_height_pct';
+  const url = URL.createObjectURL(new Blob([header + '\r\n', logRows.join('\r\n')], {type:'text/csv'}));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'flappy-droniee-motion-' + new Date().toISOString().replaceAll(':', '-') + '.csv';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+setInterval(() => {
+  const now = performance.now();
+  if (!linked || !ping || now - ping.received > 2500) ping = undefined;
+  telemetry.textContent = 'Ping ' + (ping ? Math.round(ping.ms) + ' ms' : '—') +
+    ' · Gyro gap ' + (linked && maxGap ? Math.round(maxGap) + ' ms' : '—');
+  maxGap = 0;
+  if (linked && send) {
+    probe = now;
+    send({type:'ping', id:probe});
+  } else {
+    probe = undefined;
+  }
+}, 1000);
+
+async function getSession() {
+  const response = await fetch('/session');
+  if (!response.ok) throw Error('Open the game from its local HTTPS host.');
+  const session = await response.json();
+  for (const id of ['qr','link']) byId(id).hidden = session.paired;
+  byId('qr').src = session.qr;
+  byId('link').href = session.url;
+  return session;
+}
+function multiply([a,b,c,d],[e,f,g,h]) {
+  return [a*e-b*f-c*g-d*h,a*f+b*e+c*h-d*g,a*g-b*h+c*e+d*f,a*h+b*g-c*f+d*e];
+}
+function rebase() {
+  previous = undefined;
+  pose = identity();
+  poseTilt = 0;
+  tiltRate = 0;
+  predictionRate = 0;
+  targetRate = 0;
+}
+window.addEventListener('keydown', event => {
+  if (mode !== 'playing' || event.repeat || event.altKey || event.ctrlKey || event.metaKey ||
+      event.target.closest?.('input, textarea, select, [contenteditable]') ||
+      event.key.toLowerCase() !== RECENTRE_KEY) return;
+  angle = 0;
+  rebase();
+  logEvent('recentre', performance.now());
+});
+function fullTilt() {
+  return clamp(Number(tiltInput.value) || 20, 1, 90);
+}
+function filterAlpha(cutoff, dt) {
+  const weight = 2 * Math.PI * cutoff * dt;
+  return weight / (1 + weight);
+}
+function updateConnection() {
+  const wasLinked = linked;
+  linked = hostState === 'connected' && phoneState === 'live' && performance.now() - lastArrival < 1000;
+  if (wasLinked && !linked) rebase();
+  if (mode === 'playing' || mode === 'paused') {
+    mode = linked && !manuallyPaused ? 'playing' : 'paused';
+  }
+  const text = hostState !== 'connected' ? 'Host ' + hostState :
+    linked ? 'Phone live' : phoneState === 'waiting' ? 'Waiting for pairing' :
+    phoneState === 'paired' ? 'Paired · waiting for motion' : 'Waiting for phone to reconnect';
+  if (status.textContent !== text) status.textContent = text;
+  overlay.hidden = mode === 'playing';
+  start.hidden = mode === 'paused' && !manuallyPaused;
+  start.disabled = !linked;
+  reset.disabled = hostState !== 'connected';
+  const startLabel = mode === 'ended' ? 'Play Again' : manuallyPaused ? 'Resume Game' : 'Start Game';
+  if (start.textContent !== startLabel) start.textContent = startLabel;
+  byId('pairing').hidden = phoneState !== 'waiting' && hostState === 'connected';
+  const title = mode === 'ended' ? 'Run over' : manuallyPaused ? 'Game paused' :
+    mode === 'paused' ? 'Waiting for live motion' : 'Ready to fly';
+  const hint = {
+    ready: linked ? 'Hold the phone in landscape and start when ready.' : 'Pair your phone to start.',
+    paused: manuallyPaused ? 'Resume from your phone or this screen.' : 'Your run will resume when motion returns.',
+    ended: 'Score ' + score
+  }[mode];
+  if (byId('run-title').textContent !== title) byId('run-title').textContent = title;
+  if (hint && byId('run-hint').textContent !== hint) byId('run-hint').textContent = hint;
+  const state = mode === 'paused' && !manuallyPaused ? 'waiting' : mode;
+  if (hostState === 'connected' && send && reportedRun !== state) {
+    send({type:'run', state});
+    reportedRun = state;
+  }
+}
+function sample(packet) {
+  const now = performance.now();
+  const gap = now - lastArrival;
+  if (Number.isFinite(gap)) maxGap = Math.max(maxGap, gap);
+  lastArrival = now;
+  if (!linked) updateConnection();
+  if (mode !== 'playing' && !manuallyPaused) {
+    logEvent('sample', now, packet, gap);
+    return;
+  }
+  if (gap >= 1000 || (previous && (packet.t <= previous.t || packet.t - previous.t > .25))) rebase();
+  if (previous) {
+    const sampleDt = packet.t - previous.t;
+    const rates = packet.rates.map((rate,i) => (rate + previous.rates[i]) / 2);
+    const speed = Math.hypot(...rates);
+    if (speed) {
+      const half = speed * sampleDt / 2;
+      const next = multiply(pose, [Math.cos(half), ...rates.map(rate => rate * Math.sin(half) / speed)]);
+      const length = Math.hypot(...next);
+      pose = next.map(value => value / length);
+    }
+    const [w,x,y,z] = pose;
+    const measuredTilt = -Math.atan2(2*(w*y-x*z),1-2*(y*y+z*z)) * 180 / Math.PI;
+    const delta = ((measuredTilt - poseTilt + 180) % 360 + 360) % 360 - 180;
+    poseTilt = measuredTilt;
+    const limit = fullTilt();
+    const nextAngle = clamp(angle + delta, -limit, limit);
+    const movement = nextAngle - angle;
+    tiltRate = Math.abs(movement) < .04 ? 0 : clamp(movement / sampleDt, -360, 360);
+    if (tiltRate * predictionRate < 0) predictionRate = 0;
+    predictionRate += (clamp(tiltRate, -120, 120) - predictionRate) * filterAlpha(14, sampleDt);
+    if (mode === 'playing' && movement > .15 && height < .98 && now - lastChime > 300) {
+      jumpSound();
+      lastChime = now;
+    }
+    angle = nextAngle;
+  }
+  previous = packet;
+  logEvent('sample', now, packet, gap);
+}
+function jumpSound() {
+  if (!audio || audio.state !== 'running') return;
+  const tone = audio.createOscillator(), gain = audio.createGain(), now = audio.currentTime;
+  tone.frequency.setValueAtTime(360, now);
+  tone.frequency.exponentialRampToValueAtTime(690, now + .12);
+  gain.gain.setValueAtTime(.085, now);
+  gain.gain.exponentialRampToValueAtTime(.001, now + .16);
+  tone.connect(gain).connect(audio.destination);
+  tone.start();
+  tone.stop(now + .17);
+}
+function startRun() {
+  runNumber++;
+  mode = 'playing';
+  manuallyPaused = false;
+  angle = 0;
+  height = .5;
+  previousTarget = .5;
+  rebase();
+  distance = 0;
+  elapsed = 0;
+  round = 1;
+  score = 0;
+  gates = [];
+  pattern = undefined;
+  patternStep = 0;
+  previousGapCenter = canvas.height / 2;
+  drifter = undefined;
+  nextDrifterAt = undefined;
+  laser = undefined;
+  nextLaserAt = 0;
+  lastChime = -Infinity;
+  settings.open = false;
+  updateConnection();
+  logEvent('run_start', performance.now());
+}
+function enableSound() {
+  const Audio = window.AudioContext ?? window.webkitAudioContext;
+  if (Audio) {
+    audio ??= new Audio();
+    audio.resume().then(() => { sound.textContent = 'Sound Enabled'; }).catch(() => {});
+  }
+}
+sound.onclick = enableSound;
+start.onclick = () => {
+  if (!linked) return;
+  if (manuallyPaused) {
+    manuallyPaused = false;
+    updateConnection();
+    return;
+  }
+  enableSound();
+  startRun();
+};
+try {
+  const session = await getSession();
+  send = connect('game', session.gameKey, packet => {
+    if (packet.type === 'sample') sample(packet);
+    if (packet.type === 'pong' && packet.id === probe) {
+      const received = performance.now();
+      ping = {ms:received - probe, received};
+      logEvent('ping', received);
+    }
+    if (packet.type === 'control') {
+      if (linked && ((packet.action === 'start' && mode === 'ready') ||
+          (packet.action === 'restart' && mode === 'ended'))) {
+        startRun();
+      } else if (['pause','resume'].includes(packet.action) && (mode === 'playing' || mode === 'paused')) {
+        manuallyPaused = packet.action === 'pause';
+        updateConnection();
+      }
+    }
+    if (packet.type === 'connection') {
+      const wasWaiting = phoneState !== 'waiting';
+      phoneState = packet.state;
+      if (packet.state !== 'live') {
+        lastArrival = -Infinity;
+        rebase();
+      }
+      if (wasWaiting && phoneState === 'waiting') getSession().catch(error => { status.textContent = error.message; });
+      updateConnection();
+      logEvent('connection', performance.now());
+    }
+  }, state => {
+    hostState = state;
+    reportedRun = undefined;
+    updateConnection();
+  });
+  reset.onclick = () => send({type:'reset'});
+} catch (error) {
+  status.textContent = error.message;
+}
+function frame(now) {
+  const frameGap = Math.max(0, now - previousFrame);
+  const dt = Math.min(.05, frameGap / 1000);
+  previousFrame = now;
+  if (hostState === 'connected' || linked) updateConnection();
+  if (mode === 'playing') {
+    const maxTilt = fullTilt();
+    const deadZone = Math.min(.6, maxTilt * .1);
+    const sampleAge = Math.max(0, (now - lastArrival) / 1000);
+    const estimateTime = Math.min(sampleAge, .025);
+    const projectedAngle = clamp(angle + predictionRate * estimateTime, -maxTilt, maxTilt);
+    const tilt = Math.sign(projectedAngle) *
+      Math.max(0, Math.abs(projectedAngle) - deadZone) / (maxTilt - deadZone);
+    const target = clamp(.5 + tilt / 2, 0, 1);
+    if (dt > 0) {
+      const derivative = (target - previousTarget) / dt;
+      targetRate += (derivative - targetRate) * filterAlpha(8, dt);
+      // One Euro increases the cutoff during movement and lowers it when steady.
+      height += (target - height) * filterAlpha(5 + 14 * Math.abs(targetRate), dt);
+      previousTarget = target;
+    }
+    logEvent('frame', now, undefined, undefined,
+      [target * 100, frameGap, sampleAge * 1000, projectedAngle, estimateTime * 1000]);
+    advanceWorld(frameGap / 1000, now);
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+function spawnPipe(now) {
+  const opening = elapsed < STRAIGHT_ONLY_S;
+  if (opening) {
+    pattern = PIPE_PATTERNS[0];
+    patternStep = 0;
+  } else if (!pattern || patternStep >= pattern.offsets.length) {
+    const available = PIPE_PATTERNS.filter(item => score >= item.startScore);
+    const choices = available.length > 1 ? available.filter(item => item !== pattern) : available;
+    pattern = choices[Math.floor(Math.random() * choices.length)];
+    patternStep = 0;
+    patternDirection = previousGapCenter < canvas.height / 2 ? -1 : 1;
+  }
+  const patternOffset = pattern.offsets[patternStep++];
+  const offset = opening ? 0 : patternOffset * patternDirection;
+  const shrink = pattern.name === 'narrow' ? score * GAP_SHRINK_PER_POINT : 0;
+  const halfGap = Math.max(SMALL_GAP, LARGE_GAP - shrink) / 2;
+  const limit = canvas.height * MAX_JUMP / 100;
+  const margin = halfGap + PIPE_CENTER_MARGIN;
+  const center = clamp(canvas.height / 2 + offset,
+    Math.max(margin, previousGapCenter - limit),
+    Math.min(canvas.height - margin, previousGapCenter + limit));
+  const gate = {x:distance + PIPE_SPAWN_EDGE, center, halfGap, pattern:pattern.name,
+    width:pattern.name === 'tunnel' ? TUNNEL_WIDTH : PIPE_WIDTH, passed:false};
+  previousGapCenter = center;
+  gates.push(gate);
+  logEvent('pipe_spawn', now, undefined, undefined, undefined, undefined, gate);
+}
+function clearOfPipes(x) {
+  const clearance = DRIFTER_RADIUS + MIN_ENEMY_PIPE_DISTANCE;
+  return gates.every(gate => {
+    const left = gate.x - distance - 3;
+    const right = left + gate.width + 6;
+    return x + clearance <= left || x - clearance >= right;
+  });
+}
+function updateDrifter(step, now) {
+  if (drifter) {
+    drifter.x -= DRIFTER_SPEED * step;
+    drifter.age += step;
+    drifter.y = drifter.center + DRIFTER_WAVE_HEIGHT * Math.sin(DRIFTER_WAVE_SPEED * drifter.age);
+    if (drifter.x < -DRIFTER_RADIUS || !clearOfPipes(drifter.x)) drifter = undefined;
+  }
+  if (score < DRIFTER_START_SCORE) return;
+  const nextInterval = () => DRIFTER_SPAWN_INTERVAL_MIN +
+    Math.random() * (DRIFTER_SPAWN_INTERVAL_MAX - DRIFTER_SPAWN_INTERVAL_MIN);
+  nextDrifterAt ??= elapsed + nextInterval();
+  if (drifter || elapsed < nextDrifterAt) return;
+  const x = canvas.width + DRIFTER_RADIUS;
+  if (!clearOfPipes(x)) return;
+  const y = canvas.height / 2 + (Math.random() < .5 ? -DRIFTER_LANE_OFFSET : DRIFTER_LANE_OFFSET);
+  drifter = {type:'drifter', x, y, center:y, age:0};
+  nextDrifterAt = elapsed + nextInterval();
+  logEvent('enemy_spawn', now, undefined, undefined, undefined, undefined, undefined, drifter);
+}
+function endRun(cause, now) {
+  mode = 'ended';
+  logEvent('death', now, undefined, undefined, undefined, cause);
+}
+function updateLaser(step, now) {
+  if (laser) {
+    // Keep a newly shown warning or firing state through its first rendered frame.
+    if (laser.frame === now) return;
+    laser.remaining -= step;
+    if (laser.remaining > 0) return;
+    if (laser.phase === 'warning') {
+      laser.phase = 'firing';
+      laser.remaining = LASER_FIRE_S;
+      laser.frame = now;
+      logEvent('laser_fire', now, undefined, undefined, undefined, undefined, undefined, undefined, laser);
+    } else {
+      laser = undefined;
+      nextLaserAt = elapsed + LASER_COOLDOWN_S;
+    }
+    return;
+  }
+  if (score < LASER_START_SCORE || elapsed < nextLaserAt || drifter) return;
+  const halfBand = canvas.height * LASER_BAND_PCT / 200;
+  // Include every pipe that could reach the drone before the laser ends.
+  const lookAhead = 172 + 3 + MAX_SPEED * (LASER_WARNING_S + LASER_FIRE_S + MAX_WORLD_STEP_S);
+  let highestOpening = canvas.height / 2;
+  let lowestOpening = highestOpening;
+  for (const gate of gates) {
+    const left = gate.x - distance;
+    if (left > lookAhead || left + gate.width + 3 < 128) continue;
+    highestOpening = Math.min(highestOpening, gate.center - gate.halfGap);
+    lowestOpening = Math.max(lowestOpening, gate.center + gate.halfGap);
+  }
+  const safeRanges = [
+    [halfBand, highestOpening - LASER_CLEARANCE - halfBand],
+    [lowestOpening + LASER_CLEARANCE + halfBand, canvas.height - halfBand]
+  ].filter(([min, max]) => min <= max);
+  if (!safeRanges.length) return;
+  const [min, max] = safeRanges[Math.floor(Math.random() * safeRanges.length)];
+  laser = {center:min + Math.random() * (max - min), halfBand, phase:'warning',
+    remaining:LASER_WARNING_S, frame:now};
+  logEvent('laser_warning', now, undefined, undefined, undefined, undefined, undefined, undefined, laser);
+}
+function advanceWorld(seconds, now) {
+  // Use the whole frame gap, checking collisions in smaller steps after a slow frame.
+  while (seconds > 0 && mode === 'playing') {
+    const step = Math.min(seconds, MAX_WORLD_STEP_S);
+    seconds -= step;
+    elapsed += step;
+    round = 1 + Math.floor(elapsed / ROUND_DURATION_S);
+    distance += Math.min(MAX_SPEED, START_SPEED + elapsed * SPEED_GAIN_PER_SECOND) * step;
+    const last = gates.at(-1);
+    if (!last || last.x + last.width - distance < PIPE_SPAWN_EDGE - PIPE_CLEARANCE) {
+      spawnPipe(now);
+    }
+    updateLaser(step, now);
+    if (!laser) updateDrifter(step, now);
+    const y = 402 - height * 364;
+    if (laser?.phase === 'firing' && Math.abs(y - laser.center) <= laser.halfBand + LASER_CLEARANCE) {
+      endRun('laser', now);
+      updateConnection();
+      break;
+    }
+    if (drifter && Math.hypot(drifter.x - clamp(drifter.x, 128, 172),
+        drifter.y - clamp(drifter.y, y - 10, y + 10)) <= DRIFTER_RADIUS) {
+      endRun('drifter', now);
+      updateConnection();
+      break;
+    }
+    for (const gate of gates) {
+      const x = gate.x - distance;
+      if (x - 3 < 172 && x + gate.width + 3 > 128 && Math.abs(y - gate.center) > gate.halfGap - 10) {
+        endRun('pipe', now);
+        break;
+      }
+      if (!gate.passed && x + gate.width < 132) { gate.passed = true; score++; }
+    }
+    if (gates[0] && gates[0].x + gates[0].width - distance < -3) gates.shift();
+    if (mode === 'ended') updateConnection();
+  }
+}
+function draw() {
+  ctx.fillStyle = sky; ctx.fillRect(0,0,960,440);
+  ctx.fillStyle = '#84bbcc33';
+  for (let i=0;i<42;i++) {
+    const x = ((i*107-distance*.2)%960+960)%960;
+    ctx.fillRect(x, 25+i*73%390, 3+i%4, 2);
+  }
+  for (const gate of gates) {
+    const x = gate.x - distance;
+    ctx.fillStyle = '#123243';
+    ctx.fillRect(x,0,gate.width,gate.center-gate.halfGap);
+    ctx.fillRect(x,gate.center+gate.halfGap,gate.width,440);
+    ctx.fillStyle = '#71d5bf';
+    ctx.fillRect(x-3,gate.center-gate.halfGap-6,gate.width+6,6);
+    ctx.fillRect(x-3,gate.center+gate.halfGap,gate.width+6,6);
+  }
+  if (drifter) {
+    ctx.fillStyle = '#ff865c';
+    ctx.beginPath();
+    ctx.arc(drifter.x, drifter.y, DRIFTER_RADIUS, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  if (laser) {
+    const firing = laser.phase === 'firing';
+    const bandHeight = firing ? laser.halfBand * 2 : LASER_WARNING_WIDTH;
+    ctx.fillStyle = firing ? '#ff4069' : '#ff759280';
+    ctx.fillRect(0, laser.center - bandHeight / 2, canvas.width, bandHeight);
+  }
+  const y = 402 - height * 364;
+  ctx.fillStyle = '#91fff0'; ctx.fillRect(135,y-4,30,10);
+  ctx.fillStyle = '#c8eaff'; ctx.fillRect(128,y-10,15,4); ctx.fillRect(157,y-10,15,4);
+  ctx.fillStyle = '#ffdb94'; ctx.fillRect(144,y+6,12,3);
+  for (const [id, label] of [['score', 'Score ' + score], ['level', 'Round ' + round]]) {
+    const display = byId(id);
+    if (display.textContent !== label) display.textContent = label;
+  }
+  const heightLabel = 'Height ' + Math.round(height * 100) + '%';
+  if (heightDisplay.textContent !== heightLabel) heightDisplay.textContent = heightLabel;
+}
+requestAnimationFrame(frame);
+</script>
+</html>

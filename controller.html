@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flappy Droniee Controller</title>
+<style>
+body{background:#101925;color:#edf9ff;font:1rem system-ui;display:grid;place-items:center;min-height:90vh;margin:1rem;text-align:center}
+button{padding:1rem;border:0;border-radius:.6rem;background:#7bf2d1;color:#132229;font:600 1rem system-ui}
+button:disabled{opacity:.55}
+</style>
+<main>
+<h1>Flappy Droniee Controller</h1>
+<p id="status" role="status">Tap Enable Motion to connect.</p>
+<button id="enable">Enable Motion</button>
+<button id="pause" type="button" hidden disabled>Pause Game</button>
+</main>
+<script type="module">
+import {connect} from '/link.js';
+const status = document.querySelector('#status');
+const enable = document.querySelector('#enable');
+const pause = document.querySelector('#pause');
+const pairing = location.hash.slice(1);
+const storageKey = 'gyro-resume:' + pairing;
+if (!pairing) {
+  status.textContent = 'Scan the QR on the game screen.';
+  enable.disabled = true;
+}
+enable.onclick = async () => {
+  enable.disabled = true;
+  try {
+    if (!window.isSecureContext || !window.DeviceMotionEvent) throw Error('Motion requires a supported browser and trusted HTTPS.');
+    if (typeof DeviceMotionEvent.requestPermission === 'function' &&
+        await DeviceMotionEvent.requestPermission() !== 'granted') throw Error('Allow motion access in your browser.');
+    let linked = false, motionReady = false, lastSample = -Infinity, run = 'ready';
+    const controls = {
+      ready: ['Start Game', 'start'],
+      playing: ['Pause Game', 'pause'],
+      paused: ['Resume Game', 'resume'],
+      ended: ['Play Again', 'restart']
+    };
+    function updateButton() {
+      pause.disabled = !linked || !motionReady || !controls[run];
+      pause.textContent = controls[run]?.[0] ?? 'Waiting for Game';
+    }
+    const resumeKey = sessionStorage.getItem(storageKey) ??
+      Array.from(crypto.getRandomValues(new Uint8Array(24)), byte => byte.toString(16).padStart(2,'0')).join('');
+    sessionStorage.setItem(storageKey, resumeKey);
+    const send = connect('phone', pairing, packet => {
+      if (packet.type === 'ping') {
+        send({type:'pong', id:packet.id});
+        return;
+      }
+      if (packet.type !== 'run') return;
+      run = packet.state;
+      updateButton();
+    }, state => {
+      linked = state === 'connected';
+      motionReady = false;
+      if (linked) {
+        enable.hidden = true;
+        pause.hidden = false;
+      } else if (state.startsWith('Old pairing link') || state.startsWith('Phone already paired')) {
+        enable.hidden = true;
+        pause.hidden = true;
+      }
+      updateButton();
+      status.textContent = linked ? 'Connected. Tilt your phone to control the drone.' : state;
+    }, resumeKey);
+    pause.onclick = () => {
+      if (!pause.disabled) send({type:'control', action:controls[run][1]});
+    };
+    window.addEventListener('devicemotion', event => {
+      if (!linked || event.timeStamp <= lastSample) return;
+      const {alpha, beta, gamma} = event.rotationRate ?? {};
+      if (![alpha, beta, gamma].every(Number.isFinite)) {
+        if (status.textContent !== 'Waiting for gyroscope readings.') {
+          status.textContent = 'Waiting for gyroscope readings.';
+        }
+        return;
+      }
+      lastSample = event.timeStamp;
+      send({type:'sample', t:lastSample / 1000, rates:[alpha,beta,gamma].map(rate => rate * Math.PI / 180)});
+      if (!motionReady) {
+        motionReady = true;
+        updateButton();
+      }
+      if (status.textContent !== 'Motion live. Keep this page open.') {
+        status.textContent = 'Motion live. Keep this page open.';
+      }
+    });
+  } catch (error) {
+    status.textContent = error.message;
+    enable.disabled = false;
+  }
+};
+</script>
+</html>

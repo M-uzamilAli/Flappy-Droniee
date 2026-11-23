@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gyroscope Replay</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101418;color:#eef5f4;font:16px system-ui}main{max-width:1000px;margin:auto;padding:28px}h1{margin:0 0 8px}p,small{color:#a8b8bf}section{background:#192127;border:1px solid #35444b;border-radius:14px;padding:16px;margin-top:16px}canvas{width:100%;display:block}button,input,select{font:inherit}button,select{background:#25343c;color:white;border:1px solid #52646a;border-radius:7px;padding:6px 12px}input[type=range]{width:100%;accent-color:#62ead1}label{display:inline-block;margin:6px 8px 6px 0}.active{color:#62ead1}#message{min-height:1.4em}.controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+</style>
+<main>
+<h1>Gyroscope replay</h1>
+<p>Open a phyphox export to replay your phone’s rotation from a neutral landscape pose with the camera on the left.</p>
+<label>Recording (.csv, .zip, .xlsx) <input id="file" type="file" accept=".csv,.zip,.xlsx"></label>
+<div id="message" role="status"></div>
+<section aria-labelledby="live-heading">
+<h2 id="live-heading">phyphox Live Mode</h2>
+<p>On the same Wi-Fi, open Gyroscope in phyphox, allow remote access, and start measuring. Hold the phone comfortably in landscape, camera on the left, then click Set Neutral.</p>
+<form id="live-form" class="controls">
+<label>Phone address <input id="phone-address" type="text" inputmode="url" placeholder="http://192.168.1.42:8080" required></label>
+<button id="connect">Connect Phone</button>
+<button id="recenter" type="button" disabled>Set Neutral</button>
+</form>
+<div id="live-status" role="status"></div>
+</section>
+<section><canvas id="phone" width="920" height="320" aria-label="3D phone orientation, neutral in landscape with the front camera on the left"></canvas>
+<div class="controls"><button id="play" disabled>Play</button><button id="last" disabled>Final 10 s</button><button id="full" disabled>Full recording</button><label>Speed <select id="speed"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option></select></label><output id="clock">0.00 s</output></div>
+<input id="seek" type="range" aria-label="Replay position" min="0" max="1" step="any" value="0" disabled>
+<small>Neutral grip: landscape, screen facing you, camera on the left. Gyroscope drift can accumulate over time.</small></section>
+<section><output id="values">X — · Y — · Z —</output><canvas id="chart" width="920" height="190" aria-label="X, Y and Z rotation rates over time"></canvas><small>Rotation rates in rad/s. Dots at ±2.0 rad/s flag quick turns on Y for reference.</small></section>
+<section><h2>Drone altitude preview</h2>
+<div class="controls">
+<label>Full tilt from neutral (°) <input id="max-tilt" type="number" min="1" max="90" step="1" value="35"></label>
+</div>
+<canvas id="drone" width="920" height="160" aria-label="Drone altitude during the replay"></canvas>
+<output id="drone-status" aria-live="off">Load a recording to preview its motion.</output>
+<p><small>Tip the top edge down to climb and back up to descend. Hold the angle to hold altitude.</small></p></section>
+</main>
+<script>
+const byId = id => document.getElementById(id);
+const seek = byId('seek'), play = byId('play'), msg = byId('message');
+const phone = byId('phone').getContext('2d'), chart = byId('chart').getContext('2d');
+const drone = byId('drone').getContext('2d');
+const colors = ['#f49c82','#62ead1','#a7a9ff'];
+let samples = [], clip = [], boosts = [], cursor = 0, started = null, request = 0;
+const gyroBuffers = ['gyr_time', 'gyrX', 'gyrY', 'gyrZ'];
+const connect = byId('connect'), recenter = byId('recenter'), liveStatus = byId('live-status');
+let live = null, readingRecording = false;
+
+async function readRecording(file) {
+  const extension = file.name.split('.').at(-1).toLowerCase();
+  if (extension === 'csv') return parse(await file.text());
+  if (!['zip', 'xlsx'].includes(extension)) throw Error('Choose a CSV, ZIP, or Excel .xlsx file.');
+
+  const bytes = new Uint8Array(await file.arrayBuffer()), view = new DataView(bytes.buffer);
+  let end = bytes.length - 22;
+  while (end >= Math.max(0, bytes.length - 65557) && view.getUint32(end,true) !== 0x06054b50) end--;
+  if (end < Math.max(0, bytes.length - 65557)) throw Error('Could not read the ZIP directory.');
+  let entry = view.getUint32(end+16,true);
+  const files = [];
+  for (let i=0; i<view.getUint16(end+10,true); i++) {
+    if (view.getUint32(entry,true) !== 0x02014b50) throw Error('Invalid ZIP entry.');
+    const length = view.getUint16(entry+28,true);
+    const name = new TextDecoder().decode(bytes.subarray(entry+46,entry+46+length));
+    files.push({name, entry});
+    entry += 46 + length + view.getUint16(entry+30,true) + view.getUint16(entry+32,true);
+  }
+  async function extract(item) {
+    const local = view.getUint32(item.entry+42,true), method = view.getUint16(item.entry+10,true);
+    const start = local+30+view.getUint16(local+26,true)+view.getUint16(local+28,true);
+    const data = bytes.subarray(start,start+view.getUint32(item.entry+20,true));
+    if (method === 0) return new TextDecoder().decode(data);
+    if (method === 8) return new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).text();
+    throw Error('Unsupported ZIP compression.');
+  }
+  if (extension === 'xlsx') {
+    const xml = text => new DOMParser().parseFromString(text, 'application/xml');
+    const nodes = (root, tag) => Array.from(root.getElementsByTagNameNS('*', tag));
+    const stringsFile = files.find(item => item.name === 'xl/sharedStrings.xml');
+    const shared = stringsFile ? nodes(xml(await extract(stringsFile)), 'si').map(item =>
+      nodes(item, 't').map(part => part.textContent).join('')) : [];
+    for (const sheet of files.filter(item => /^xl\/worksheets\/[^/]+\.xml$/.test(item.name))) {
+      const rows = nodes(xml(await extract(sheet)), 'row').map(row => {
+        const values = [];
+        for (const cell of nodes(row, 'c')) {
+          const column = (cell.getAttribute('r') || '').match(/^[A-Z]+/)?.[0];
+          const index = column ? [...column].reduce((n, letter) => n * 26 + letter.charCodeAt(0) - 64, 0) - 1 : values.length;
+          const value = nodes(cell, 'v')[0]?.textContent ?? '';
+          const type = cell.getAttribute('t');
+          values[index] = type === 's' ? shared[Number(value)] ?? '' :
+            type === 'inlineStr' ? nodes(cell, 't').map(part => part.textContent).join('') : value;
+        }
+        return values;
+      });
+      const samples = parseRows(rows);
+      if (samples) return samples;
+    }
+    throw Error('No Excel worksheet contained time and three gyroscope axes.');
+  }
+  for (const item of files.filter(item => /\.csv$/i.test(item.name))) {
+    try { return parse(await extract(item)); } catch { /* Try the next CSV entry. */ }
+  }
+  throw Error('No gyro CSV could be read in the ZIP. Try opening the extracted CSV directly.');
+}
+
+function parse(csv) {
+  const lines = csv.trim().split(/\r\n|\n|\r/);
+  for (const separator of [';', ',', '\t']) {
+    const rows = lines.map(line => line.split(separator).map(v => v.trim().replace(/^"|"$/g, '')));
+    const samples = parseRows(rows);
+    if (samples) return samples;
+  }
+  throw Error('Expected CSV columns for time and gyroscope X, Y and Z.');
+}
+
+function parseRows(rows) {
+    for (let i=0; i<Math.min(rows.length,30); i++) {
+      const header = Array.from(rows[i], value => String(value ?? '').trim().toLowerCase());
+      const axes = ['x', 'y', 'z'].map(axis => header.findIndex(value =>
+        new RegExp('(?:^|[^a-z])(?:w|ω)?' + axis + '(?:$|[^a-z])').test(value)));
+      const time = header.findIndex(value => /^(?:time|timestamp|t)(?:\b|_)/.test(value));
+      const columns = [time, ...axes];
+      if (new Set(columns).size !== 4 || columns.includes(-1)) continue;
+      const samples = [];
+      for (const values of rows.slice(i+1)) {
+        const row = columns.map(c => {
+          const value = String(values[c] ?? '').trim();
+          return value ? Number(value.replace(',', '.')) : NaN;
+        });
+        if (row.every(Number.isFinite) && (!samples.length || row[0]>samples.at(-1)[0])) samples.push(row);
+      }
+      if (samples.length>1) return samples;
+    }
+    return null;
+}
+
+function multiply([a,b,c,d],[e,f,g,h]) {
+  return [a*e-b*f-c*g-d*h,a*f+b*e+c*h-d*g,a*g-b*h+c*e+d*f,a*h+b*g-c*f+d*e];
+}
+function integrate(previous, rates, dt) {
+  const magnitude = Math.hypot(...rates);
+  if (!magnitude) return previous;
+  const half = magnitude*dt/2, scale = Math.sin(half)/magnitude;
+  const next = multiply(previous,[Math.cos(half),...rates.map(value=>value*scale)]);
+  return next.map(value=>value/Math.hypot(...next));
+}
+function newDirections() {
+  return [{ sign:1, armed:true }, { sign:-1, armed:true }];
+}
+function appendSample(row, directions) {
+    const last = clip.at(-1), previous = last?.row;
+    let q = last?.q ?? [1,0,0,0];
+    if (previous) q = integrate(q,row.slice(1).map((v,i)=>(v+previous[i+1])/2),row[0]-previous[0]);
+    for (const detector of directions) {
+      const rate = detector.sign * row[2];
+      if (rate <= 1.5) detector.armed = true;
+      if (detector.armed && previous && detector.sign * previous[2] < 2 && rate >= 2) {
+        const before = detector.sign * previous[2];
+        const fraction = (2 - before) / (rate - before);
+        const start = previous[0] + fraction * (row[0] - previous[0]);
+        boosts.push({start, direction:detector.sign});
+        detector.armed = false;
+      }
+    }
+    clip.push({row,q});
+}
+function selectClip(duration) {
+  stop();
+  const cutoff = samples.at(-1)[0]-duration;
+  clip = []; boosts = [];
+  const directions = newDirections();
+  for (const row of samples) {
+    if (row[0]>=cutoff) appendSample(row, directions);
+  }
+  seek.max = clip.at(-1).row[0]-clip[0].row[0];
+  seek.value = 0; cursor = 0; draw();
+}
+
+function drawPhone(q) {
+  const [w,x,y,z] = q;
+  const project = ([a,b,c]) => {
+    const [,rawX,rawY,dz] = multiply(multiply(q,[0,a,b,c]),[w,-x,-y,-z]);
+    // The phone's portrait top (+Y) points left in this landscape grip.
+    const dx = -rawY, dy = rawX;
+    const depth = dz*Math.cos(.32)-dy*Math.sin(.32);
+    const scale = 1.65*550/(550-depth);
+    return [460+dx*scale,160-(dy*Math.cos(.32)+dz*Math.sin(.32))*scale,depth];
+  };
+  const drawSurface = (points, color) => {
+    phone.beginPath();
+    points.forEach((point, index) => {
+      const [x, y] = project(point);
+      if (index) phone.lineTo(x, y);
+      else phone.moveTo(x, y);
+    });
+    phone.closePath();
+    phone.fillStyle = color;
+    phone.fill();
+  };
+  const screen = [[-32,-70,5],[32,-70,5],[32,70,5],[-32,70,5]];
+  const camera = Array.from({length: 24}, (_, index) => {
+    const angle = index * Math.PI / 12;
+    return [4 * Math.cos(angle), 63 + 4 * Math.sin(angle), 5];
+  });
+  const corners = [[-38,-76],[38,-76],[38,76],[-38,76]];
+  const vertices = [-5,5].flatMap(d=>corners.map(([a,b])=>project([a,b,d])));
+  const faces = [[0,1,2,3],[4,5,6,7],[0,1,5,4],[1,2,6,5],[2,3,7,6],[3,0,4,7]];
+  phone.clearRect(0,0,920,320);
+  faces.map((indices,i)=>({i,points:indices.map(j=>vertices[j])}))
+    .sort((a,b)=>a.points.reduce((s,p)=>s+p[2],0)-b.points.reduce((s,p)=>s+p[2],0))
+    .forEach(({i,points})=>{
+      phone.beginPath();
+      points.forEach(([a,b],j)=>j?phone.lineTo(a,b):phone.moveTo(a,b));
+      phone.closePath();phone.fillStyle=i===1?'#285c61':'#27343d';phone.fill();
+      phone.strokeStyle='#81bcbc';phone.lineWidth=2;phone.stroke();
+      if(i===1){
+        drawSurface(screen, '#10262d');
+        drawSurface(camera, '#c3f8e4');
+      }
+    });
+}
+
+function draw() {
+  if (!clip.length) {
+    drawPhone([1,0,0,0]);drawDrone(null);
+    chart.clearRect(0,0,920,190);
+    byId('clock').textContent='0.00 s';
+    byId('values').classList.remove('active');
+    byId('values').textContent='X — · Y — · Z —';
+    return;
+  }
+  const start=clip[0].row[0];
+  const duration=live ? clip.at(-1).row[0]-start : Number(seek.max);
+  const time=live ? clip.at(-1).row[0] : start+cursor;
+  let low=0,high=clip.length-1;
+  while(low<high){const mid=Math.floor((low+high+1)/2);if(clip[mid].row[0]<=time)low=mid;else high=mid-1;}
+  const {row,q}=clip[low]; drawPhone(q);
+  drawDrone(time,q);
+  byId('clock').textContent=(live ? time-live.zeroTime : time).toFixed(2)+' s';
+  const recent=boosts.findLast(({start})=>time>=start&&time-start<0.23);
+  byId('values').classList.toggle('active',Boolean(recent));
+  byId('values').textContent=row.slice(1).map((v,i)=>'XYZ'[i]+' '+v.toFixed(2)).join(' · ')+(recent?(recent.direction>0?' · UP':' · DOWN'):'');
+  chart.clearRect(0,0,920,190);
+  let bound=2.5;
+  for(const {row:r} of clip) bound=Math.max(bound,Math.abs(r[1]),Math.abs(r[2]),Math.abs(r[3]));
+  const y=v=>95-v*74/bound, x=t=>46+(t-start)*850/(duration||1);
+  chart.font='14px system-ui';chart.fillStyle='#a8b8bf';chart.fillText('0',18,100);chart.fillText('+2',12,y(2)+4);chart.fillText('−2',12,y(-2)+4);
+  chart.strokeStyle='#52646a';
+  for(const level of [0,2,-2]){
+    chart.setLineDash(level?[5,5]:[]);chart.beginPath();chart.moveTo(46,y(level));chart.lineTo(896,y(level));chart.stroke();
+  }
+  chart.setLineDash([]);
+  colors.forEach((color,axis)=>{
+    chart.strokeStyle=color;chart.beginPath();
+    clip.forEach(({row:r},i)=>i?chart.lineTo(x(r[0]),y(r[axis+1])):chart.moveTo(x(r[0]),y(r[axis+1])));
+    chart.stroke();chart.fillStyle=color;chart.fillText('XYZ'[axis],770+axis*48,174);
+  });
+  chart.fillStyle=colors[1];
+  for(const {start,direction} of boosts){chart.beginPath();chart.arc(x(start),y(2*direction),4,0,Math.PI*2);chart.fill();}
+  chart.strokeStyle='white';chart.beginPath();chart.moveTo(x(time),12);chart.lineTo(x(time),160);chart.stroke();
+}
+function drawDrone(time, pose = [1,0,0,0]) {
+  const maxTilt = Math.min(90, Math.max(1, Number(byId('max-tilt').value) || 35));
+  const [w,x,yAxis,z] = pose;
+  const tilt = live && !live.neutralSet ? 0 :
+    Math.atan2(2*(w*yAxis-x*z),1-2*(yAxis*yAxis+z*z))*180/Math.PI;
+  const tiltFraction = Math.max(-1, Math.min(1, tilt/maxTilt));
+  const altitude = .5 + .5 * tiltFraction;
+  const y = 124 - altitude * 94;
+  drone.clearRect(0,0,920,160);
+  drone.fillStyle='#25343c';drone.fillRect(0,138,920,4);
+  drone.fillStyle='#62ead1';drone.fillRect(438,y-8,44,16);
+  drone.fillStyle='#a7a9ff';drone.fillRect(421,y-11,18,5);drone.fillRect(481,y-11,18,5);
+  byId('drone-status').textContent = live && !live.neutralSet ? 'Set Neutral in your playing grip to start at 50% altitude.' :
+    time === null ? 'Load a recording or connect your phone to preview motion.' :
+    Math.round(altitude*100) + '% altitude · ' + tilt.toFixed(1) + '° tilt';
+}
+function stop(){cancelAnimationFrame(request);request=0;started=null;play.textContent='Play';}
+function tick(now){
+  if(started!==null) cursor=Math.min(Number(seek.max),cursor+(now-started)*Number(byId('speed').value)/1000);
+  started=now;seek.value=cursor;draw();
+  if(cursor>=Number(seek.max))stop();else request=requestAnimationFrame(tick);
+}
+play.onclick=()=>{
+  if(request){stop();return;}
+  if(cursor>=Number(seek.max))cursor=0;
+  play.textContent='Pause';request=requestAnimationFrame(tick);
+};
+seek.oninput=()=>{cursor=Number(seek.value);draw();};
+byId('last').onclick=()=>selectClip(10);
+byId('full').onclick=()=>selectClip(Infinity);
+byId('max-tilt').oninput=draw;
+
+function updateControls() {
+  const replayDisabled = Boolean(live) || !samples.length;
+  for (const control of [play, seek, byId('last'), byId('full')]) control.disabled = replayDisabled;
+  byId('speed').disabled = Boolean(live);
+  byId('phone-address').disabled = Boolean(live);
+  byId('file').disabled = Boolean(live) || readingRecording;
+  connect.disabled = readingRecording;
+  connect.textContent = live ? 'Disconnect' : 'Connect Phone';
+  recenter.disabled = !live || !clip.length;
+  recenter.textContent = live?.neutralSet ? 'Recenter' : 'Set Neutral';
+}
+
+function resetLivePose(stream) {
+  clip = [];
+  boosts = [];
+  stream.directions = newDirections();
+  stream.zeroTime = null;
+  stream.neutralSet = false;
+}
+
+function disconnect(message) {
+  const stream = live;
+  live = null;
+  clearTimeout(stream.timer);
+  stream.controller?.abort();
+  clip = stream.replay.clip;
+  boosts = stream.replay.boosts;
+  cursor = stream.replay.cursor;
+  liveStatus.textContent = message;
+  updateControls();
+  draw();
+}
+
+async function getGyro(stream, signal, after = null) {
+  const url = new URL('/get', stream.origin);
+  if (after === null) {
+    url.search = gyroBuffers.join('&');
+  } else {
+    for (const name of gyroBuffers) {
+      url.searchParams.set(name, name === gyroBuffers[0] ? String(after) : after + '|gyr_time');
+    }
+  }
+  const response = await fetch(url, {signal, cache: 'no-store'});
+  if (!response.ok) throw Error('phyphox returned HTTP ' + response.status + '.');
+  const {buffer, status} = await response.json();
+  const columns = gyroBuffers.map(name => buffer?.[name]?.buffer);
+  if (!columns.every(Array.isArray)) throw Error('Open the Gyroscope experiment in phyphox and reconnect.');
+  if (!columns.every(column => column.length === columns[0].length)) {
+    throw Error('phyphox returned gyro samples with mismatched timestamps and axes.');
+  }
+  return {status, rows: columns[0].map((_, index) => columns.map(column => column[index]))};
+}
+
+async function pollGyro(stream) {
+  const controller = new AbortController();
+  stream.controller = controller;
+  const timeout = setTimeout(() => controller.abort(), 3000);
+  try {
+    let {status, rows} = await getGyro(stream, controller.signal, stream.lastTime);
+    if (live !== stream) return;
+    if (stream.lastTime !== null && (status?.session !== stream.session || !rows.length)) {
+      const latest = await getGyro(stream, controller.signal);
+      if (live !== stream) return;
+      if (latest.status?.session !== stream.session || !latest.rows.length ||
+          !Number.isFinite(latest.rows[0][0]) || latest.rows[0][0] < stream.lastTime) {
+        resetLivePose(stream);
+        stream.lastTime = null;
+        ({status, rows} = latest);
+      }
+    }
+    stream.session = status?.session;
+    for (const row of rows) {
+      if (!row.every(Number.isFinite) || (stream.lastTime !== null && row[0] <= stream.lastTime)) continue;
+      stream.zeroTime ??= row[0];
+      appendSample(row, stream.directions);
+      stream.lastTime = row[0];
+    }
+    if (clip.length) {
+      const oldest = stream.lastTime - 10;
+      const first = clip.findIndex(({row}) => row[0] >= oldest);
+      if (first > 0) clip.splice(0, first);
+      boosts = boosts.filter(({start}) => start >= oldest);
+    }
+    liveStatus.textContent = status?.measuring
+      ? clip.length ? 'Live · graph shows the last 10 seconds' : 'Connected · waiting for gyroscope data'
+      : 'Connected · press Start in phyphox to measure.';
+    updateControls();
+    draw();
+    stream.timer = setTimeout(() => pollGyro(stream), status?.measuring ? 50 : 500);
+  } catch (error) {
+    if (live !== stream) return;
+    const message = error.name === 'AbortError' || error instanceof TypeError
+      ? 'Could not reach the phone. Open its phyphox address in a PC browser to check the connection, and allow local network access if prompted.'
+      : error.message;
+    disconnect(message);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+byId('live-form').onsubmit = event => {
+  event.preventDefault();
+  if (live) {
+    disconnect('Disconnected.');
+    return;
+  }
+  const address = byId('phone-address').value.trim();
+  let url;
+  try {
+    url = new URL(address.includes('://') ? address : 'http://' + address);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw Error();
+  } catch {
+    liveStatus.textContent = 'Enter the address shown in phyphox, including its port if shown.';
+    return;
+  }
+  stop();
+  live = {origin: url.origin, lastTime: null, replay: {clip, boosts, cursor}};
+  resetLivePose(live);
+  liveStatus.textContent = 'Connecting…';
+  updateControls();
+  draw();
+  pollGyro(live);
+};
+
+recenter.onclick = () => {
+  const {row} = clip.at(-1);
+  resetLivePose(live);
+  live.neutralSet = true;
+  live.zeroTime = row[0];
+  appendSample(row, live.directions);
+  updateControls();
+  draw();
+};
+
+byId('file').onchange=async event=>{
+  const file=event.target.files[0];if(!file)return;
+  readingRecording = true;
+  updateControls();
+  stop();msg.textContent='Reading recording…';
+  try {
+    samples=await readRecording(file);
+    selectClip(Infinity);msg.textContent=file.name+' · '+samples.length.toLocaleString()+' samples';
+  } catch(error){msg.textContent=error.message;}
+  finally {
+    readingRecording = false;
+    updateControls();
+  }
+};
+draw();
+</script></html>

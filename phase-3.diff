@@ -1,0 +1,138 @@
+diff --git a/.phase-3-before.html b/game.html
+index ec9e41e..e7dba13 100644
+--- a/.phase-3-before.html
++++ b/game.html
+@@ -85,6 +85,15 @@ const TUNNEL_WIDTH = 174;
+ const PIPE_SPAWN_EDGE = 990;
+ const PIPE_CLEARANCE = 222;
+ const PIPE_CENTER_MARGIN = 32;
++const DRIFTER_SPEED = 210;
++const DRIFTER_WAVE_HEIGHT = 28;
++const DRIFTER_WAVE_SPEED = 2.4;
++const DRIFTER_SPAWN_INTERVAL_MIN = 6;
++const DRIFTER_SPAWN_INTERVAL_MAX = 10;
++const DRIFTER_START_SCORE = 5;
++const DRIFTER_RADIUS = 15;
++const DRIFTER_LANE_OFFSET = 70;
++const MIN_ENEMY_PIPE_DISTANCE = 90;
+ const PIPE_PATTERNS = [
+   {name:'straight', startScore:0, offsets:[0]},
+   {name:'zigzag', startScore:1, offsets:[-42, 42, -42]},
+@@ -98,6 +107,7 @@ let pose = identity(), previous, poseTilt = 0, angle = 0, height = .5;
+ let tiltRate = 0, predictionRate = 0, previousTarget = .5, targetRate = 0;
+ let distance = 0, elapsed = 0, round = 1, score = 0, gates = [], audio, lastChime = -Infinity;
+ let pattern, patternStep, previousGapCenter;
++let drifter, nextDrifterAt;
+ let hostState = 'connecting', previousFrame = performance.now();
+ let probe, ping, maxGap = 0;
+ const logStarted = performance.now();
+@@ -105,7 +115,7 @@ const logLimit = 120000;
+ const logRows = [];
+ let runNumber = 0;
+ 
+-function logEvent(event, now, packet, gap, frameData, deathCause, spawnedPipe) {
++function logEvent(event, now, packet, gap, frameData, deathCause, spawnedPipe, spawnedEnemy) {
+   if (logRows.length >= logLimit) return;
+   const freshPing = linked && ping && now - ping.received <= 2500 ? ping : undefined;
+   logRows.push([
+@@ -120,7 +130,9 @@ function logEvent(event, now, packet, gap, frameData, deathCause, spawnedPipe) {
+     deathCause ?? '', event === 'death' ? score : '',
+     ...(spawnedPipe ? [spawnedPipe.pattern,
+       (200 * spawnedPipe.halfGap / canvas.height).toFixed(3),
+-      (100 * spawnedPipe.center / canvas.height).toFixed(3)] : ['', '', ''])
++      (100 * spawnedPipe.center / canvas.height).toFixed(3)] : ['', '', '']),
++    ...(spawnedEnemy ? [spawnedEnemy.type,
++      (100 * spawnedEnemy.y / canvas.height).toFixed(3)] : ['', ''])
+   ].join(','));
+   if (logRows.length === 1) {
+     downloadLog.disabled = false;
+@@ -134,7 +146,7 @@ downloadLog.onclick = () => {
+   const header = 'event,pc_elapsed_ms,run,game_state,phone_state,phone_sample_ms,arrival_gap_ms,' +
+     'gyro_x_rad_s,gyro_y_rad_s,gyro_z_rad_s,tilt_deg,tilt_rate_deg_s,drone_height_pct,ping_rtt_ms,ping_age_ms,' +
+     'target_height_pct,frame_gap_ms,gyro_sample_age_ms,tilt_used,est_time_ms,full_tilt_deg,death_cause,score,' +
+-    'pipe_pattern,pipe_gap_size_pct,pipe_gap_height_pct';
++    'pipe_pattern,pipe_gap_size_pct,pipe_gap_height_pct,enemy_type,enemy_start_height_pct';
+   const url = URL.createObjectURL(new Blob([header + '\r\n', logRows.join('\r\n')], {type:'text/csv'}));
+   const link = document.createElement('a');
+   link.href = url;
+@@ -292,6 +304,8 @@ function startRun() {
+   pattern = undefined;
+   patternStep = 0;
+   previousGapCenter = canvas.height / 2;
++  drifter = undefined;
++  nextDrifterAt = undefined;
+   lastChime = -Infinity;
+   settings.open = false;
+   updateConnection();
+@@ -405,6 +419,37 @@ function spawnPipe(now) {
+   gates.push(gate);
+   logEvent('pipe_spawn', now, undefined, undefined, undefined, undefined, gate);
+ }
++function clearOfPipes(x) {
++  const clearance = DRIFTER_RADIUS + MIN_ENEMY_PIPE_DISTANCE;
++  return gates.every(gate => {
++    const left = gate.x - distance - 3;
++    const right = left + gate.width + 6;
++    return x + clearance <= left || x - clearance >= right;
++  });
++}
++function updateDrifter(step, now) {
++  if (drifter) {
++    drifter.x -= DRIFTER_SPEED * step;
++    drifter.age += step;
++    drifter.y = drifter.center + DRIFTER_WAVE_HEIGHT * Math.sin(DRIFTER_WAVE_SPEED * drifter.age);
++    if (drifter.x < -DRIFTER_RADIUS || !clearOfPipes(drifter.x)) drifter = undefined;
++  }
++  if (score < DRIFTER_START_SCORE) return;
++  const nextInterval = () => DRIFTER_SPAWN_INTERVAL_MIN +
++    Math.random() * (DRIFTER_SPAWN_INTERVAL_MAX - DRIFTER_SPAWN_INTERVAL_MIN);
++  nextDrifterAt ??= elapsed + nextInterval();
++  if (drifter || elapsed < nextDrifterAt) return;
++  const x = canvas.width + DRIFTER_RADIUS;
++  if (!clearOfPipes(x)) return;
++  const y = canvas.height / 2 + (Math.random() < .5 ? -DRIFTER_LANE_OFFSET : DRIFTER_LANE_OFFSET);
++  drifter = {type:'drifter', x, y, center:y, age:0};
++  nextDrifterAt = elapsed + nextInterval();
++  logEvent('enemy_spawn', now, undefined, undefined, undefined, undefined, undefined, drifter);
++}
++function endRun(cause, now) {
++  mode = 'ended';
++  logEvent('death', now, undefined, undefined, undefined, cause);
++}
+ function advanceWorld(seconds, now) {
+   // Use the whole frame gap, checking collisions in smaller steps after a slow frame.
+   while (seconds > 0 && mode === 'playing') {
+@@ -417,12 +462,18 @@ function advanceWorld(seconds, now) {
+     if (!last || last.x + last.width - distance < PIPE_SPAWN_EDGE - PIPE_CLEARANCE) {
+       spawnPipe(now);
+     }
++    updateDrifter(step, now);
+     const y = 402 - height * 364;
++    if (drifter && Math.hypot(drifter.x - clamp(drifter.x, 128, 172),
++        drifter.y - clamp(drifter.y, y - 10, y + 10)) <= DRIFTER_RADIUS) {
++      endRun('drifter', now);
++      updateConnection();
++      break;
++    }
+     for (const gate of gates) {
+       const x = gate.x - distance;
+       if (x - 3 < 172 && x + gate.width + 3 > 128 && Math.abs(y - gate.center) > gate.halfGap - 10) {
+-        mode = 'ended';
+-        logEvent('death', now, undefined, undefined, undefined, 'pipe');
++        endRun('pipe', now);
+         break;
+       }
+       if (!gate.passed && x + gate.width < 132) { gate.passed = true; score++; }
+@@ -447,6 +498,12 @@ function draw() {
+     ctx.fillRect(x-3,gate.center-gate.halfGap-6,gate.width+6,6);
+     ctx.fillRect(x-3,gate.center+gate.halfGap,gate.width+6,6);
+   }
++  if (drifter) {
++    ctx.fillStyle = '#ff865c';
++    ctx.beginPath();
++    ctx.arc(drifter.x, drifter.y, DRIFTER_RADIUS, 0, Math.PI * 2);
++    ctx.fill();
++  }
+   const y = 402 - height * 364;
+   ctx.fillStyle = '#91fff0'; ctx.fillRect(135,y-4,30,10);
+   ctx.fillStyle = '#c8eaff'; ctx.fillRect(128,y-10,15,4); ctx.fillRect(157,y-10,15,4);
