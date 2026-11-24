@@ -16,6 +16,16 @@ button:disabled{opacity:.55}
 </main>
 <script type="module">
 import {connect} from '/link.js';
+// Rotate orientation q by turn rates (rad/s, phone axes) held for dt seconds.
+function turn([a,b,c,d], rates, dt) {
+  const speed = Math.hypot(...rates);
+  if (!speed) return [a,b,c,d];
+  const half = speed * dt / 2;
+  const [e,f,g,h] = [Math.cos(half), ...rates.map(rate => rate * Math.sin(half) / speed)];
+  const next = [a*e-b*f-c*g-d*h, a*f+b*e+c*h-d*g, a*g-b*h+c*e+d*f, a*h+b*g-c*f+d*e];
+  const length = Math.hypot(...next);
+  return next.map(value => value / length);
+}
 const status = document.querySelector('#status');
 const enable = document.querySelector('#enable');
 const pause = document.querySelector('#pause');
@@ -69,8 +79,11 @@ enable.onclick = async () => {
     pause.onclick = () => {
       if (!pause.disabled) send({type:'control', action:controls[run][1]});
     };
+    // The phone keeps its own orientation, built up from gyroscope turn rates, and sends
+    // the whole orientation each time. A lost or late message then loses no rotation.
+    let pose = [1,0,0,0], previousRates;
     window.addEventListener('devicemotion', event => {
-      if (!linked || event.timeStamp <= lastSample) return;
+      if (event.timeStamp <= lastSample) return;
       const {alpha, beta, gamma} = event.rotationRate ?? {};
       if (![alpha, beta, gamma].every(Number.isFinite)) {
         if (status.textContent !== 'Waiting for gyroscope readings.') {
@@ -78,8 +91,14 @@ enable.onclick = async () => {
         }
         return;
       }
+      const rates = [alpha, beta, gamma].map(rate => rate * Math.PI / 180);
+      const dt = (event.timeStamp - lastSample) / 1000;
+      // Skip a step after a long pause in readings, as the turn during it is unknown.
+      if (previousRates && dt <= .25) pose = turn(pose, rates.map((rate, i) => (rate + previousRates[i]) / 2), dt);
+      previousRates = rates;
       lastSample = event.timeStamp;
-      send({type:'sample', t:lastSample / 1000, rates:[alpha,beta,gamma].map(rate => rate * Math.PI / 180)});
+      if (!linked) return;
+      send({type:'pose', t:lastSample / 1000, q:pose.map(value => +value.toFixed(7))});
       if (!motionReady) {
         motionReady = true;
         updateButton();

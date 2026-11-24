@@ -140,13 +140,14 @@ sockets.on('connection', ws => {
       send(game, {type:'control', action:packet.action});
       return;
     }
-    if (role !== 'phone' || ws !== phone || packet.type !== 'sample') return;
-    const {t, rates} = packet;
-    if (!Number.isFinite(t) || t <= lastTime || !Array.isArray(rates) ||
-        rates.length !== 3 || !rates.every(value => Number.isFinite(value) && Math.abs(value) <= 100)) return;
+    if (role !== 'phone' || ws !== phone || packet.type !== 'pose') return;
+    // The phone's orientation: four numbers that together have length 1.
+    const {t, q} = packet;
+    if (!Number.isFinite(t) || t <= lastTime || !Array.isArray(q) || q.length !== 4 ||
+        !q.every(Number.isFinite) || Math.abs(Math.hypot(...q) - 1) > .001) return;
     lastTime = t;
     if (phoneState !== 'live') { phoneState = 'live'; report(); }
-    send(game, {type:'sample', t, rates});
+    send(game, {type:'pose', t, q});
   });
   ws.on('close', () => {
     clearTimeout(joinDeadline);

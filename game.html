@@ -68,7 +68,6 @@ const sky = ctx.createLinearGradient(0,0,0,440);
 sky.addColorStop(0,'#12243a');
 sky.addColorStop(1,'#346277');
 const clamp = (x, min, max) => Math.max(min, Math.min(max, x));
-const identity = () => [1,0,0,0];
 const MAX_WORLD_STEP_S = .05;
 const ROUND_DURATION_S = 20;
 const START_SPEED = 155;
@@ -103,7 +102,7 @@ const MIN_ENEMY_PIPE_DISTANCE = 90;
 const LASER_WARNING_S = 1;
 const LASER_FIRE_S = .5;
 const LASER_START_SCORE = 10;
-const LASER_BAND_PCT = 12;
+const LASER_BAND_PCT = 8;
 const LASER_COOLDOWN_S = 6;
 const LASER_WARNING_WIDTH = 4;
 const LASER_CLEARANCE = 10;
@@ -124,7 +123,7 @@ const PIPE_PATTERNS = [
 ];
 let mode = 'ready', linked = false, phoneState = 'waiting', lastArrival = -Infinity;
 let manuallyPaused = false, send, reportedRun;
-let pose = identity(), previous, poseTilt = 0, angle = 0, height = .5;
+let reference, previous, poseTilt = 0, angle = 0, height = .5;
 let tiltRate = 0, predictionRate = 0, previousTarget = .5, targetRate = 0;
 let distance = 0, elapsed = 0, round = 1, score = 0, gates = [], audio, lastChime = -Infinity;
 let pattern, patternStep, patternDirection, previousGapCenter;
@@ -144,7 +143,7 @@ function logEvent(event, now, packet, gap, frameData, deathCause, spawnedPipe, s
     event, (now - logStarted).toFixed(3), runNumber, mode, phoneState,
     packet ? (packet.t * 1000).toFixed(3) : '',
     Number.isFinite(gap) ? gap.toFixed(3) : '',
-    ...(packet ? packet.rates.map(rate => rate.toFixed(5)) : ['', '', '']),
+    ...(packet ? packet.q.map(value => value.toFixed(6)) : ['', '', '', '']),
     angle.toFixed(3), tiltRate.toFixed(3), (height * 100).toFixed(3),
     freshPing?.ms.toFixed(3) ?? '', freshPing ? Math.max(0, now - freshPing.received).toFixed(3) : '',
     ...(frameData ? frameData.map(value => value.toFixed(3)) : ['', '', '', '', '']),
@@ -167,7 +166,7 @@ function logEvent(event, now, packet, gap, frameData, deathCause, spawnedPipe, s
 
 downloadLog.onclick = () => {
   const header = 'event,pc_elapsed_ms,run,game_state,phone_state,phone_sample_ms,arrival_gap_ms,' +
-    'gyro_x_rad_s,gyro_y_rad_s,gyro_z_rad_s,tilt_deg,tilt_rate_deg_s,drone_height_pct,ping_rtt_ms,ping_age_ms,' +
+    'phone_pose_w,phone_pose_x,phone_pose_y,phone_pose_z,tilt_deg,tilt_rate_deg_s,drone_height_pct,ping_rtt_ms,ping_age_ms,' +
     'target_height_pct,frame_gap_ms,gyro_sample_age_ms,tilt_used,est_time_ms,full_tilt_deg,death_cause,score,' +
     'pipe_pattern,pipe_gap_size_pct,pipe_gap_height_pct,enemy_type,enemy_start_height_pct,laser_band_height_pct';
   const url = URL.createObjectURL(new Blob([header + '\r\n', logRows.join('\r\n')], {type:'text/csv'}));
@@ -204,9 +203,10 @@ async function getSession() {
 function multiply([a,b,c,d],[e,f,g,h]) {
   return [a*e-b*f-c*g-d*h,a*f+b*e+c*h-d*g,a*g-b*h+c*e+d*f,a*h+b*g-c*f+d*e];
 }
+const conjugate = ([w,x,y,z]) => [w,-x,-y,-z];
 function rebase() {
   previous = undefined;
-  pose = identity();
+  reference = undefined;
   poseTilt = 0;
   tiltRate = 0;
   predictionRate = 0;
@@ -270,18 +270,16 @@ function sample(packet) {
     logEvent('sample', now, packet, gap);
     return;
   }
-  if (gap >= 1000 || (previous && (packet.t <= previous.t || packet.t - previous.t > .25))) rebase();
+  // Each packet holds the phone's whole orientation, so a stale one adds nothing.
+  if (previous && packet.t <= previous.t) {
+    logEvent('sample', now, packet, gap);
+    return;
+  }
+  // The orientation at the last start or recentre is neutral; tilt is measured from it.
+  reference ??= conjugate(packet.q);
   if (previous) {
     const sampleDt = packet.t - previous.t;
-    const rates = packet.rates.map((rate,i) => (rate + previous.rates[i]) / 2);
-    const speed = Math.hypot(...rates);
-    if (speed) {
-      const half = speed * sampleDt / 2;
-      const next = multiply(pose, [Math.cos(half), ...rates.map(rate => rate * Math.sin(half) / speed)]);
-      const length = Math.hypot(...next);
-      pose = next.map(value => value / length);
-    }
-    const [w,x,y,z] = pose;
+    const [w,x,y,z] = multiply(reference, packet.q);
     const measuredTilt = -Math.atan2(2*(w*y-x*z),1-2*(y*y+z*z)) * 180 / Math.PI;
     const delta = ((measuredTilt - poseTilt + 180) % 360 + 360) % 360 - 180;
     poseTilt = measuredTilt;
@@ -357,7 +355,7 @@ start.onclick = () => {
 try {
   const session = await getSession();
   send = connect('game', session.gameKey, packet => {
-    if (packet.type === 'sample') sample(packet);
+    if (packet.type === 'pose') sample(packet);
     if (packet.type === 'pong' && packet.id === probe) {
       const received = performance.now();
       ping = {ms:received - probe, received};
