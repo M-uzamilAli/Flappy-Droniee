@@ -44,6 +44,7 @@ a{overflow-wrap:anywhere}
 <summary>Controller settings</summary>
 <div class="controls">
 <label>Full tilt from neutral <input id="tilt" type="number" value="20" min="1" max="90"> °</label>
+<label title="Predicts your tilt this far ahead to hide phone and screen delay. 0 turns prediction ahead off.">Look-ahead <input id="lookahead" type="number" value="40" min="0" max="100"> ms</label>
 <button id="reset" disabled>Reset Phone Pairing</button></div>
 <p><button id="sound" type="button">Enable Sound</button></p>
 <p><button id="download-log" type="button" disabled>Download Motion Log</button>
@@ -60,7 +61,7 @@ import {connect} from '/link.js';
 const byId = id => document.getElementById(id);
 const canvas = byId('field'), ctx = canvas.getContext('2d');
 const status = byId('status'), start = byId('start'), reset = byId('reset');
-const heightDisplay = byId('height'), tiltInput = byId('tilt');
+const heightDisplay = byId('height'), tiltInput = byId('tilt'), lookAheadInput = byId('lookahead');
 const overlay = byId('overlay'), settings = byId('settings');
 const telemetry = byId('telemetry'), sound = byId('sound');
 const downloadLog = byId('download-log'), logStatus = byId('log-status');
@@ -74,6 +75,9 @@ const START_SPEED = 155;
 const MAX_SPEED = 380;
 const SPEED_GAIN_PER_SECOND = 3.5;
 const RECENTRE_KEY = 'c';
+// Prediction trusts tilt speeds up to this, and never guesses more than this many degrees ahead.
+const PREDICTION_RATE_LIMIT = 400;
+const MAX_PREDICTED_TILT = 4;
 const STRAIGHT_ONLY_S = 20;
 const LARGE_GAP = 168;
 const SMALL_GAP = 96;
@@ -220,6 +224,9 @@ window.addEventListener('keydown', event => {
   rebase();
   logEvent('recentre', performance.now());
 });
+function lookAhead() {
+  return clamp(Number(lookAheadInput.value) || 0, 0, 100) / 1000;
+}
 function fullTilt() {
   return clamp(Number(tiltInput.value) || 20, 1, 90);
 }
@@ -288,7 +295,8 @@ function sample(packet) {
     const movement = nextAngle - angle;
     tiltRate = Math.abs(movement) < .04 ? 0 : clamp(movement / sampleDt, -360, 360);
     if (tiltRate * predictionRate < 0) predictionRate = 0;
-    predictionRate += (clamp(tiltRate, -120, 120) - predictionRate) * filterAlpha(14, sampleDt);
+    predictionRate += (clamp(tiltRate, -PREDICTION_RATE_LIMIT, PREDICTION_RATE_LIMIT) - predictionRate) *
+      filterAlpha(14, sampleDt);
     if (mode === 'playing' && movement > .15 && height < .98 && now - lastChime > 300) {
       jumpSound();
       lastChime = now;
@@ -399,8 +407,10 @@ function frame(now) {
     const maxTilt = fullTilt();
     const deadZone = Math.min(.6, maxTilt * .1);
     const sampleAge = Math.max(0, (now - lastArrival) / 1000);
-    const estimateTime = Math.min(sampleAge, .025);
-    const projectedAngle = clamp(angle + predictionRate * estimateTime, -maxTilt, maxTilt);
+    // Predict up to now from the last reading, plus the look-ahead to cover phone and screen delay.
+    const estimateTime = Math.min(sampleAge, .025) + lookAhead();
+    const guess = clamp(predictionRate * estimateTime, -MAX_PREDICTED_TILT, MAX_PREDICTED_TILT);
+    const projectedAngle = clamp(angle + guess, -maxTilt, maxTilt);
     const tilt = Math.sign(projectedAngle) *
       Math.max(0, Math.abs(projectedAngle) - deadZone) / (maxTilt - deadZone);
     const target = clamp(.5 + tilt / 2, 0, 1);
