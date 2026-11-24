@@ -72,19 +72,25 @@ const identity = () => [1,0,0,0];
 const MAX_WORLD_STEP_S = .05;
 const ROUND_DURATION_S = 20;
 const START_SPEED = 155;
-const MAX_SPEED = 340;
-const SPEED_GAIN_PER_SECOND = 2.6;
+const MAX_SPEED = 380;
+const SPEED_GAIN_PER_SECOND = 3.5;
 const RECENTRE_KEY = 'c';
 const STRAIGHT_ONLY_S = 20;
 const LARGE_GAP = 168;
-const SMALL_GAP = 112;
-const GAP_SHRINK_PER_POINT = 4;
+const SMALL_GAP = 96;
+const GAP_SHRINK_PER_POINT = 5;
 const MAX_JUMP = 55;
 const PIPE_WIDTH = 58;
 const TUNNEL_WIDTH = 174;
 const PIPE_SPAWN_EDGE = 990;
 const PIPE_CLEARANCE = 222;
 const PIPE_CENTER_MARGIN = 32;
+const MOVING_PIPE_START_SCORE = 2;
+const PIPE_MOVE_AMPLITUDE_MIN = 16;
+const PIPE_MOVE_AMPLITUDE_MAX = 30;
+const PIPE_MOVE_SPEED_MIN = .8;
+const PIPE_MOVE_SPEED_MAX = 1.25;
+const RANDOM_PIPE_SHIFT = 20;
 const DRIFTER_SPEED = 210;
 const DRIFTER_WAVE_HEIGHT = 28;
 const DRIFTER_WAVE_SPEED = 2.4;
@@ -97,10 +103,13 @@ const MIN_ENEMY_PIPE_DISTANCE = 90;
 const LASER_WARNING_S = 1;
 const LASER_FIRE_S = .5;
 const LASER_START_SCORE = 10;
-const LASER_BAND_PCT = 18;
+const LASER_BAND_PCT = 12;
 const LASER_COOLDOWN_S = 6;
 const LASER_WARNING_WIDTH = 4;
 const LASER_CLEARANCE = 10;
+const LASER_ESCAPE_LANE = 30;
+const LASER_RECOVERY_S = .6;
+const LASER_AIM_SPREAD = 12;
 const STRAIGHT_OFFSET = 34;
 const ZIGZAG_OFFSET = 66;
 const STAIR_OFFSET = 58;
@@ -424,19 +433,37 @@ function spawnPipe(now) {
     patternDirection = previousGapCenter < canvas.height / 2 ? -1 : 1;
   }
   const patternOffset = pattern.offsets[patternStep++];
-  const offset = opening ? 0 : patternOffset * patternDirection;
+  const offset = opening ? 0 : patternOffset * patternDirection +
+    (Math.random() * 2 - 1) * RANDOM_PIPE_SHIFT;
   const shrink = pattern.name === 'narrow' ? score * GAP_SHRINK_PER_POINT : 0;
   const halfGap = Math.max(SMALL_GAP, LARGE_GAP - shrink) / 2;
   const limit = canvas.height * MAX_JUMP / 100;
   const margin = halfGap + PIPE_CENTER_MARGIN;
+  const moving = !opening && score >= MOVING_PIPE_START_SCORE;
+  const amplitude = moving ? Math.min(PIPE_MOVE_AMPLITUDE_MAX,
+    PIPE_MOVE_AMPLITUDE_MIN + score * 1.5) : 0;
+  const previous = gates.at(-1);
+  const previousAmplitude = previous?.amplitude ?? 0;
   const center = clamp(canvas.height / 2 + offset,
-    Math.max(margin, previousGapCenter - limit),
-    Math.min(canvas.height - margin, previousGapCenter + limit));
+    Math.max(margin, previousGapCenter - limit + amplitude + previousAmplitude),
+    Math.min(canvas.height - margin, previousGapCenter + limit - amplitude - previousAmplitude));
   const gate = {x:distance + PIPE_SPAWN_EDGE, center, halfGap, pattern:pattern.name,
-    width:pattern.name === 'tunnel' ? TUNNEL_WIDTH : PIPE_WIDTH, passed:false};
+    width:pattern.name === 'tunnel' ? TUNNEL_WIDTH : PIPE_WIDTH, passed:false,
+    amplitude, speed:moving ? PIPE_MOVE_SPEED_MIN + Math.random() *
+      (PIPE_MOVE_SPEED_MAX - PIPE_MOVE_SPEED_MIN) : 0,
+    phase:Math.random() * Math.PI * 2, age:0, baseCenter:center};
   previousGapCenter = center;
   gates.push(gate);
   logEvent('pipe_spawn', now, undefined, undefined, undefined, undefined, gate);
+}
+function updatePipes(step) {
+  for (const gate of gates) {
+    gate.age += step;
+    if (!gate.amplitude) continue;
+    const margin = gate.halfGap + PIPE_CENTER_MARGIN;
+    gate.center = clamp(gate.baseCenter + gate.amplitude *
+      Math.sin(gate.phase + gate.age * gate.speed), margin, canvas.height - margin);
+  }
 }
 function clearOfPipes(x) {
   const clearance = DRIFTER_RADIUS + MIN_ENEMY_PIPE_DISTANCE;
@@ -451,7 +478,16 @@ function updateDrifter(step, now) {
     drifter.x -= DRIFTER_SPEED * step;
     drifter.age += step;
     drifter.y = drifter.center + DRIFTER_WAVE_HEIGHT * Math.sin(DRIFTER_WAVE_SPEED * drifter.age);
-    if (drifter.x < -DRIFTER_RADIUS || !clearOfPipes(drifter.x)) drifter = undefined;
+    for (const gate of gates) {
+      const x = gate.x - distance;
+      if (drifter.x + DRIFTER_RADIUS < x || drifter.x - DRIFTER_RADIUS > x + gate.width) continue;
+      const top = gate.center - gate.halfGap + DRIFTER_RADIUS;
+      const bottom = gate.center + gate.halfGap - DRIFTER_RADIUS;
+      const adjustedY = clamp(drifter.y, top, bottom);
+      drifter.center += adjustedY - drifter.y;
+      drifter.y = adjustedY;
+    }
+    if (drifter.x < -DRIFTER_RADIUS) drifter = undefined;
   }
   if (score < DRIFTER_START_SCORE) return;
   const nextInterval = () => DRIFTER_SPAWN_INTERVAL_MIN +
@@ -469,7 +505,7 @@ function endRun(cause, now) {
   mode = 'ended';
   logEvent('death', now, undefined, undefined, undefined, cause);
 }
-function updateLaser(step, now) {
+function updateLaser(step, now, droneY) {
   if (laser) {
     // Keep a newly shown warning or firing state through its first rendered frame.
     if (laser.frame === now) return;
@@ -488,24 +524,39 @@ function updateLaser(step, now) {
   }
   if (score < LASER_START_SCORE || elapsed < nextLaserAt || drifter) return;
   const halfBand = canvas.height * LASER_BAND_PCT / 200;
-  // Include every pipe that could reach the drone before the laser ends.
-  const lookAhead = 172 + 3 + MAX_SPEED * (LASER_WARNING_S + LASER_FIRE_S + MAX_WORLD_STEP_S);
-  let highestOpening = canvas.height / 2;
-  let lowestOpening = highestOpening;
+  // Distance from the beam's centre to the far edge of a usable escape lane.
+  const reach = halfBand + LASER_CLEARANCE + LASER_ESCAPE_LANE;
+  // Include every pipe that could reach the drone before the laser ends, plus
+  // the recovery time needed to reach the next opening after the beam is gone.
+  const lookAhead = 172 + 3 + MAX_SPEED *
+    (LASER_WARNING_S + LASER_FIRE_S + LASER_RECOVERY_S + MAX_WORLD_STEP_S);
+  // Every such pipe must keep an escape lane on the same side of the beam,
+  // wherever its opening drifts, so the drone never has to cross the beam.
+  let lowestBeamForLaneAbove = halfBand;
+  let highestBeamForLaneBelow = canvas.height - halfBand;
   for (const gate of gates) {
     const left = gate.x - distance;
     if (left > lookAhead || left + gate.width + 3 < 128) continue;
-    highestOpening = Math.min(highestOpening, gate.center - gate.halfGap);
-    lowestOpening = Math.max(lowestOpening, gate.center + gate.halfGap);
+    // The drone's centre must stay 10 px inside either pipe edge.
+    const safeHalf = gate.halfGap - 10;
+    lowestBeamForLaneAbove = Math.max(lowestBeamForLaneAbove,
+      gate.baseCenter + gate.amplitude - safeHalf + reach);
+    highestBeamForLaneBelow = Math.min(highestBeamForLaneBelow,
+      gate.baseCenter - gate.amplitude + safeHalf - reach);
   }
-  const safeRanges = [
-    [halfBand, highestOpening - LASER_CLEARANCE - halfBand],
-    [lowestOpening + LASER_CLEARANCE + halfBand, canvas.height - halfBand]
-  ].filter(([min, max]) => min <= max);
-  if (!safeRanges.length) return;
-  const [min, max] = safeRanges[Math.floor(Math.random() * safeRanges.length)];
-  laser = {center:min + Math.random() * (max - min), halfBand, phase:'warning',
-    remaining:LASER_WARNING_S, frame:now};
+  const aim = droneY + (Math.random() * 2 - 1) * LASER_AIM_SPREAD;
+  const choices = [];
+  if (lowestBeamForLaneAbove <= canvas.height - halfBand) {
+    choices.push(clamp(aim, lowestBeamForLaneAbove, canvas.height - halfBand));
+  }
+  if (highestBeamForLaneBelow >= halfBand) {
+    choices.push(clamp(aim, halfBand, highestBeamForLaneBelow));
+  }
+  // No safe placement yet: try again on a later step.
+  if (!choices.length) return;
+  const center = choices.reduce((best, y) =>
+    Math.abs(y - aim) < Math.abs(best - aim) ? y : best);
+  laser = {center, halfBand, phase:'warning', remaining:LASER_WARNING_S, frame:now};
   logEvent('laser_warning', now, undefined, undefined, undefined, undefined, undefined, undefined, laser);
 }
 function advanceWorld(seconds, now) {
@@ -520,9 +571,10 @@ function advanceWorld(seconds, now) {
     if (!last || last.x + last.width - distance < PIPE_SPAWN_EDGE - PIPE_CLEARANCE) {
       spawnPipe(now);
     }
-    updateLaser(step, now);
-    if (!laser) updateDrifter(step, now);
+    updatePipes(step);
     const y = 402 - height * 364;
+    updateLaser(step, now, y);
+    if (!laser) updateDrifter(step, now);
     if (laser?.phase === 'firing' && Math.abs(y - laser.center) <= laser.halfBand + LASER_CLEARANCE) {
       endRun('laser', now);
       updateConnection();
